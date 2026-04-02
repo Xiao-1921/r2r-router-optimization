@@ -1,0 +1,17 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+venv/
+.env
+
+# Data and Models (Usually kept locally or in LFS)
+data/*
+!data/.gitkeep
+models/*.pkl
+models/*.joblib
+
+# Cursor/IDE
+.cursor/
+.vscode/
+.DS_Store

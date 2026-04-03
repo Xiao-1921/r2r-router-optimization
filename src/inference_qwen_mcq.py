@@ -1,6 +1,6 @@
 """
 Qwen2.5-3B-Instruct MCQ inference on Apple Silicon (MPS) with token logprobs,
-entropy, and perplexity for router / uncertainty analysis.
+entropy, perplexity, and the top-5 first-token log-probabilities (for margins / kurtosis).
 
 Uses the tokenizer's built-in Qwen2.5 chat template (apply_chat_template).
 """
@@ -8,6 +8,7 @@ Uses the tokenizer's built-in Qwen2.5 chat template (apply_chat_template).
 from __future__ import annotations
 
 import argparse
+import json
 import pickle
 import re
 from pathlib import Path
@@ -75,20 +76,44 @@ def entropy_from_logits(logits: torch.Tensor) -> torch.Tensor:
     return -(p * log_p).sum(dim=-1)
 
 
+def first_token_topk_logprobs(logits_batch1: torch.Tensor, k: int = 5) -> list[float]:
+    """
+    Return the k largest log-probabilities (nats) for the first generated token distribution.
+    Sorted descending (highest logprob first). Pads with nan if vocabulary size < k.
+    """
+    logits_f = logits_batch1[0].float()
+    log_p = F.log_softmax(logits_f, dim=-1)
+    vocab = log_p.numel()
+    kk = min(k, vocab)
+    top = torch.topk(log_p, k=kk, largest=True, sorted=True)
+    values = top.values.detach().cpu().tolist()
+    if len(values) < k:
+        values = values + [float("nan")] * (k - len(values))
+    return [float(v) for v in values[:k]]
+
+
 def analyze_generation_scores(
     scores: tuple[torch.Tensor, ...],
     generated_token_ids: torch.Tensor,
-) -> dict[str, float]:
+    *,
+    top_k_first: int = 5,
+) -> dict[str, Any]:
     """
     scores[i]: logits predicting generated_token_ids[i] (batch=1).
-    Returns first-token entropy, mean entropy, mean NLL, perplexity, first-token prob.
+
+    Returns first-token entropy, mean entropy, mean NLL, perplexity, chosen-token probability,
+    and ``first_token_top5_logprobs``: the top-``top_k_first`` log-probabilities at the first
+    generated step (for Top-k margin, kurtosis, etc.).
     """
+    nan_list = [float("nan")] * top_k_first
+
     if len(scores) == 0:
         return {
             "first_token_entropy": float("nan"),
             "avg_entropy": float("nan"),
             "perplexity": float("nan"),
             "chosen_token_prob": float("nan"),
+            "first_token_top5_logprobs": nan_list,
         }
 
     entropies: list[torch.Tensor] = []
@@ -113,11 +138,14 @@ def analyze_generation_scores(
     log_p0 = F.log_softmax(scores[0][0].float(), dim=-1)
     p0 = log_p0[tid0].exp()
 
+    top5_lp = first_token_topk_logprobs(scores[0], k=top_k_first)
+
     return {
         "first_token_entropy": float(first_ent.item()),
         "avg_entropy": float(avg_ent.item()),
         "perplexity": float(perplexity.item()),
         "chosen_token_prob": float(p0.item()),
+        "first_token_top5_logprobs": top5_lp,
     }
 
 
@@ -258,6 +286,7 @@ def main() -> None:
                 "avg_entropy": float("nan"),
                 "perplexity": float("nan"),
                 "chosen_token_prob": float("nan"),
+                "first_token_top5_logprobs": [float("nan")] * 5,
             }
         else:
             n_scores = len(scores)
@@ -276,6 +305,7 @@ def main() -> None:
                 "avg_entropy": metrics["avg_entropy"],
                 "perplexity": metrics["perplexity"],
                 "chosen_token_prob": metrics["chosen_token_prob"],
+                "first_token_top5_logprobs": metrics["first_token_top5_logprobs"],
             }
         )
 
@@ -289,7 +319,10 @@ def main() -> None:
 
     df = pd.DataFrame(results)
     csv_path.parent.mkdir(parents=True, exist_ok=True)
-    df.to_csv(csv_path, index=False, encoding="utf-8")
+    df_csv = df.copy()
+    if "first_token_top5_logprobs" in df_csv.columns:
+        df_csv["first_token_top5_logprobs"] = df_csv["first_token_top5_logprobs"].apply(json.dumps)
+    df_csv.to_csv(csv_path, index=False, encoding="utf-8")
     print(f"Wrote {len(df)} rows to {csv_path}")
 
 

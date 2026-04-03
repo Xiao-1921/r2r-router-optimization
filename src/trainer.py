@@ -1,14 +1,22 @@
 """
-Baseline router comparison: heuristic Always-RAG vs default sklearn / XGBoost models.
+Baseline router comparison for the R2R Router (mid-term report).
 
-Loads `data/router_training_matrix.pkl` (from `prepare_dataset.py`), uses all `feat_*`
-columns to predict `target_label` (1 = model wrong → prefer RAG).
+Loads ``data/router_training_matrix.pkl`` (from ``prepare_dataset.py``), uses all ``feat_*``
+columns to predict ``target_label`` (1 = model answer wrong → prefer RAG).
 
-Metrics: Train F1, 5-fold CV F1 (stratified, tqdm), Test F1, Test ROC-AUC.
+Reports Train F1, 5-fold stratified CV F1 (with tqdm), Test F1, and Test ROC-AUC for:
+  - Always-RAG (always predict 1)
+  - Logistic Regression (class_weight='balanced')
+  - Random Forest (class_weight='balanced')
+  - XGBoost tuned via GridSearchCV on the full feature matrix (scale_pos_weight from y_train)
 
-XGBoost additionally runs GridSearchCV over depth, learning rate, n_estimators, subsample,
-and L1/L2 regularization (reg_alpha / reg_lambda), saves `outputs/feature_importance.png`,
-and prints unoptimized vs tuned metrics.
+The best XGBoost pipeline from GridSearchCV is used for ``outputs/feature_importance.png``
+(all features, ranked; default top 18 bars when 18 features exist).
+
+A calibration section plots reliability diagrams (``sklearn.calibration.calibration_curve``) for a
+vanilla Qwen score (``1 - chosen_token_prob`` as P(wrong)) and the tuned XGBoost router, fits
+Platt scaling via ``CalibratedClassifierCV(..., method='sigmoid')``, and reports test F1 and ECE;
+``outputs/calibration_plot.png`` stores the combined figure.
 """
 
 from __future__ import annotations
@@ -25,6 +33,7 @@ from sklearn.base import clone
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.impute import SimpleImputer
 from sklearn.linear_model import LogisticRegression
+from sklearn.calibration import CalibratedClassifierCV, calibration_curve
 from sklearn.metrics import f1_score, roc_auc_score
 from sklearn.model_selection import GridSearchCV, StratifiedKFold, train_test_split
 from sklearn.pipeline import Pipeline
@@ -104,13 +113,16 @@ def plot_xgb_feature_importance(
     importances: np.ndarray,
     out_path: Path,
     *,
-    top_k: int = 25,
+    top_k: int | None = 18,
+    title: str = "XGBoost (GridSearchCV-tuned) — feature importance",
 ) -> None:
-    """Save a horizontal bar chart of XGBoost feature importances."""
+    """Save a horizontal bar chart of the highest XGBoost feature importances."""
     if plt is None:
         raise RuntimeError("matplotlib is required for feature importance plots: pip install matplotlib")
 
-    order = np.argsort(importances)[::-1][:top_k]
+    n = len(feature_names)
+    k = n if top_k is None else min(top_k, n)
+    order = np.argsort(importances)[::-1][:k]
     names = [feature_names[i] for i in order]
     vals = importances[order]
 
@@ -119,7 +131,87 @@ def plot_xgb_feature_importance(
     ax.set_yticks(range(len(names)))
     ax.set_yticklabels(names[::-1], fontsize=9)
     ax.set_xlabel("Feature importance (XGBoost default)")
-    ax.set_title("XGBoost (tuned) — feature importance")
+    ax.set_title(title)
+    fig.tight_layout()
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(out_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+
+
+def expected_calibration_error(
+    y_true: np.ndarray,
+    y_prob: np.ndarray,
+    *,
+    n_bins: int = 10,
+) -> float:
+    """
+    Expected calibration error (ECE): weighted mean |accuracy − confidence| over probability bins.
+    """
+    y_true = np.asarray(y_true).astype(int).ravel()
+    y_prob = np.asarray(y_prob, dtype=float).ravel()
+    bin_edges = np.linspace(0.0, 1.0, n_bins + 1)
+    ece = 0.0
+    for i in range(n_bins):
+        lo, hi = bin_edges[i], bin_edges[i + 1]
+        if i == n_bins - 1:
+            mask = (y_prob >= lo) & (y_prob <= hi)
+        else:
+            mask = (y_prob >= lo) & (y_prob < hi)
+        w = float(mask.mean())
+        if w == 0:
+            continue
+        acc = float(y_true[mask].mean())
+        conf = float(y_prob[mask].mean())
+        ece += w * abs(acc - conf)
+    return float(ece)
+
+
+def f1_at_threshold(y_true: np.ndarray, y_prob: np.ndarray, threshold: float = 0.5) -> float:
+    """Binary F1 from continuous scores at a decision threshold."""
+    y_true = np.asarray(y_true).astype(int).ravel()
+    y_prob = np.asarray(y_prob, dtype=float).ravel()
+    pred = (y_prob >= threshold).astype(int)
+    return float(f1_score(y_true, pred, zero_division=0))
+
+
+def plot_calibration_reliability(
+    y_true: np.ndarray,
+    series: dict[str, np.ndarray],
+    out_path: Path,
+    *,
+    n_bins: int = 10,
+) -> None:
+    """Save a reliability diagram comparing predicted vs. empirical positive rate per bin."""
+    if plt is None:
+        raise RuntimeError("matplotlib is required for calibration plots: pip install matplotlib")
+
+    fig, ax = plt.subplots(figsize=(7, 7))
+    ax.plot([0, 1], [0, 1], "k:", linewidth=1.5, label="Perfect calibration")
+    colors = ["tab:blue", "tab:orange", "tab:green", "tab:red"]
+    for i, (name, y_prob) in enumerate(series.items()):
+        probs = np.asarray(y_prob, dtype=float).ravel()
+        probs = np.clip(probs, 1e-7, 1.0 - 1e-7)
+        prob_true, prob_pred = calibration_curve(
+            y_true,
+            probs,
+            n_bins=n_bins,
+            strategy="uniform",
+        )
+        ax.plot(
+            prob_pred,
+            prob_true,
+            marker="o",
+            linewidth=1.5,
+            label=name,
+            color=colors[i % len(colors)],
+        )
+    ax.set_xlabel("Mean predicted probability (positive class = model wrong)")
+    ax.set_ylabel("Fraction of positives (actual)")
+    ax.set_title("Reliability diagram — router calibration (test set)")
+    ax.legend(loc="lower right", fontsize=9)
+    ax.set_xlim(0.0, 1.0)
+    ax.set_ylim(0.0, 1.0)
+    ax.set_aspect("equal", adjustable="box")
     fig.tight_layout()
     out_path.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(out_path, dpi=150, bbox_inches="tight")
@@ -127,12 +219,14 @@ def plot_xgb_feature_importance(
 
 
 def print_results_table(rows: list[dict[str, Any]]) -> None:
-    header = f"{'Strategy/Model':<34} {'Train F1':>10} {'CV F1':>10} {'Test F1':>10} {'Test AUC':>10}"
+    w = 42
+    header = f"{'Strategy/Model':<{w}} {'Train F1':>10} {'CV F1':>10} {'Test F1':>10} {'Test AUC':>10}"
     print()
     print(header)
     print("-" * len(header))
     for r in rows:
-        name = str(r["name"])[:33]
+        name = str(r["name"])[: w - 1]
+
         def fmt(v: Any) -> str:
             if v is None or (isinstance(v, float) and np.isnan(v)):
                 return f"{'N/A':>10}"
@@ -141,7 +235,7 @@ def print_results_table(rows: list[dict[str, Any]]) -> None:
             return f"{v!s:>10}"
 
         print(
-            f"{name:<34} {fmt(r['train_f1'])} {fmt(r['cv_f1'])} {fmt(r['test_f1'])} {fmt(r['test_auc'])}"
+            f"{name:<{w}} {fmt(r['train_f1'])} {fmt(r['cv_f1'])} {fmt(r['test_f1'])} {fmt(r['test_auc'])}"
         )
     print()
 
@@ -162,6 +256,35 @@ def main() -> None:
         default=Path("outputs/feature_importance.png"),
         help="Path for tuned XGBoost feature importance plot",
     )
+    parser.add_argument(
+        "--importance-top-k",
+        type=int,
+        default=18,
+        help="Number of features to show in the importance plot (default: 18)",
+    )
+    parser.add_argument(
+        "--print-importance-ranking",
+        action="store_true",
+        help="Print the full XGBoost feature-importance ranking (all features, descending)",
+    )
+    parser.add_argument(
+        "--calibration-out",
+        type=Path,
+        default=Path("outputs/calibration_plot.png"),
+        help="Reliability diagram output path",
+    )
+    parser.add_argument(
+        "--calibration-bins",
+        type=int,
+        default=10,
+        help="Number of bins for calibration_curve and ECE",
+    )
+    parser.add_argument(
+        "--calibration-cv",
+        type=int,
+        default=3,
+        help="Folds inside CalibratedClassifierCV (Platt / sigmoid)",
+    )
     args = parser.parse_args()
 
     df = load_training_matrix(args.data)
@@ -172,13 +295,17 @@ def main() -> None:
     X = df[feat_cols].apply(pd.to_numeric, errors="coerce")
     y = df["target_label"].astype(int)
 
-    X_train, X_test, y_train, y_test = train_test_split(
-        X,
-        y,
+    idx_all = np.arange(len(df))
+    idx_train, idx_test = train_test_split(
+        idx_all,
         test_size=args.test_size,
         random_state=args.random_state,
         stratify=y,
     )
+    X_train = X.iloc[idx_train]
+    X_test = X.iloc[idx_test]
+    y_train = y.iloc[idx_train]
+    y_test = y.iloc[idx_test]
 
     print(f"Loaded: {args.data} | samples={len(df)} | features={len(feat_cols)}")
     print(
@@ -188,7 +315,6 @@ def main() -> None:
 
     cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=args.random_state)
 
-    # Numeric pipeline: impute then model (trees/LR); LR also scales continuous features.
     imputer = SimpleImputer(strategy="median")
 
     lr_pipe: Pipeline = Pipeline(
@@ -225,25 +351,11 @@ def main() -> None:
         raise RuntimeError("Install xgboost: pip install xgboost") from e
 
     spw = xgb_scale_pos_weight(y_train)
-    xgb_pipe: Pipeline = Pipeline(
-        steps=[
-            ("imputer", imputer),
-            (
-                "clf",
-                XGBClassifier(
-                    random_state=args.random_state,
-                    scale_pos_weight=spw,
-                    objective="binary:logistic",
-                    n_estimators=100,
-                ),
-            ),
-        ]
-    )
 
     rows: list[dict[str, Any]] = []
 
     # -------------------------------------------------------------------------
-    # Heuristic: Always-RAG (always predict positive class 1)
+    # Heuristic baseline: Always-RAG (always predict positive class 1)
     # -------------------------------------------------------------------------
     train_f1_always = f1_score(y_train, np.ones(len(y_train), dtype=int), zero_division=0)
     cv_f1_always: list[float] = []
@@ -268,7 +380,7 @@ def main() -> None:
     )
 
     # -------------------------------------------------------------------------
-    # Logistic Regression
+    # Logistic Regression (class_weight balanced)
     # -------------------------------------------------------------------------
     lr_pipe.fit(X_train, y_train)
     train_f1_lr = f1_score(y_train, lr_pipe.predict(X_train), zero_division=0)
@@ -293,7 +405,7 @@ def main() -> None:
     )
 
     # -------------------------------------------------------------------------
-    # Random Forest
+    # Random Forest (class_weight balanced)
     # -------------------------------------------------------------------------
     rf_pipe.fit(X_train, y_train)
     train_f1_rf = f1_score(y_train, rf_pipe.predict(X_train), zero_division=0)
@@ -318,35 +430,7 @@ def main() -> None:
     )
 
     # -------------------------------------------------------------------------
-    # XGBoost (unoptimized baseline — often overfits on tabular router features)
-    # -------------------------------------------------------------------------
-    xgb_pipe.fit(X_train, y_train)
-    train_f1_xgb = f1_score(y_train, xgb_pipe.predict(X_train), zero_division=0)
-    cv_f1_xgb = cross_val_f1_stratified(
-        xgb_pipe,
-        X_train,
-        y_train,
-        cv=cv,
-        desc="5-fold CV | XGBoost (unoptimized)",
-    )
-    test_f1_xgb = f1_score(y_test, xgb_pipe.predict(X_test), zero_division=0)
-    test_auc_xgb = safe_roc_auc(y_test.values, xgb_pipe.predict_proba(X_test)[:, 1])
-
-    rows.append(
-        {
-            "name": f"XGBoost unopt (spw={spw:.3f})",
-            "train_f1": train_f1_xgb,
-            "cv_f1": cv_f1_xgb,
-            "test_f1": test_f1_xgb,
-            "test_auc": test_auc_xgb,
-        }
-    )
-
-    print("\n=== Baseline comparison (Always-RAG, LR, RF, XGB unoptimized) ===")
-    print_results_table(rows)
-
-    # -------------------------------------------------------------------------
-    # XGBoost hyperparameter search (GridSearchCV) + feature importance plot
+    # XGBoost: GridSearchCV on the full feature set (scale_pos_weight from y_train)
     # -------------------------------------------------------------------------
     xgb_search_pipe = Pipeline(
         steps=[
@@ -374,7 +458,7 @@ def main() -> None:
     n_combos = int(np.prod([len(v) for v in param_grid.values()]))
     print(
         f"\nXGBoost GridSearchCV: {n_combos} param combos × 5-fold CV "
-        f"({n_combos * 5} fits) — scoring=f1 …"
+        f"({n_combos * 5} fits), scoring=f1 …"
     )
     grid = GridSearchCV(
         estimator=xgb_search_pipe,
@@ -393,39 +477,6 @@ def main() -> None:
     test_f1_xgb_t = f1_score(y_test, best.predict(X_test), zero_division=0)
     test_auc_xgb_t = safe_roc_auc(y_test.values, best.predict_proba(X_test)[:, 1])
 
-    clf_best = best.named_steps["clf"]
-    importances = np.asarray(clf_best.feature_importances_, dtype=float)
-    plot_xgb_feature_importance(
-        list(X_train.columns),
-        importances,
-        args.feature_importance_out,
-        top_k=min(25, len(feat_cols)),
-    )
-
-    print(f"\nSaved feature importance plot: {args.feature_importance_out.resolve()}")
-
-    print("\n" + "=" * 76)
-    print("XGBoost: Unoptimized vs GridSearchCV-tuned (same train/test split)")
-    print("=" * 76)
-    cmp_rows = [
-        {
-            "name": "XGBoost unoptimized",
-            "train_f1": train_f1_xgb,
-            "cv_f1": cv_f1_xgb,
-            "test_f1": test_f1_xgb,
-            "test_auc": test_auc_xgb,
-        },
-        {
-            "name": "XGBoost tuned (best CV F1)",
-            "train_f1": train_f1_xgb_t,
-            "cv_f1": cv_f1_xgb_t,
-            "test_f1": test_f1_xgb_t,
-            "test_auc": test_auc_xgb_t,
-        },
-    ]
-    print_results_table(cmp_rows)
-    print("Best params:", grid.best_params_)
-
     rows.append(
         {
             "name": "XGBoost tuned (GridSearchCV)",
@@ -436,8 +487,77 @@ def main() -> None:
         }
     )
 
-    print("\n=== Full comparison (baselines + tuned XGBoost) ===")
+    # -------------------------------------------------------------------------
+    # Calibration analysis: reliability diagram, ECE, Platt scaling (sigmoid)
+    # -------------------------------------------------------------------------
+    y_test_arr = y_test.values.astype(int)
+    prob_xgb = best.predict_proba(X_test)[:, 1]
+
+    calibration_series: dict[str, np.ndarray] = {}
+
+    if "chosen_token_prob" in df.columns:
+        cp_test = df.iloc[idx_test]["chosen_token_prob"].astype(float).values
+        prob_vanilla = np.clip(1.0 - cp_test, 1e-7, 1.0 - 1e-7)
+        calibration_series["Vanilla Qwen (1 − p_first token)"] = prob_vanilla
+    else:
+        print(
+            "\n[Calibration] Column 'chosen_token_prob' not found in training matrix; "
+            "skipping vanilla Qwen curve (re-run prepare_dataset with inference columns)."
+        )
+
+    calibration_series["XGBoost tuned (GridSearchCV)"] = prob_xgb
+
+    xgb_platt = CalibratedClassifierCV(
+        estimator=clone(best),
+        method="sigmoid",
+        cv=args.calibration_cv,
+    )
+    xgb_platt.fit(X_train, y_train)
+    prob_platt = xgb_platt.predict_proba(X_test)[:, 1]
+    calibration_series["XGBoost + Platt (CalibratedClassifierCV)"] = prob_platt
+
+    print("\n=== Calibration analysis (test set, positive class = model wrong) ===")
+    for name, p in calibration_series.items():
+        f1_t = f1_at_threshold(y_test_arr, p)
+        ece = expected_calibration_error(y_test_arr, p, n_bins=args.calibration_bins)
+        print(f"  {name}:  F1 = {f1_t:.4f}  |  ECE = {ece:.4f}")
+
+    plot_calibration_reliability(
+        y_test_arr,
+        calibration_series,
+        args.calibration_out,
+        n_bins=args.calibration_bins,
+    )
+    print(f"\nSaved calibration plot: {args.calibration_out.resolve()}")
+
+    clf_best = best.named_steps["clf"]
+    importances = np.asarray(clf_best.feature_importances_, dtype=float)
+    n_feat = len(feat_cols)
+    k_plot = None if args.importance_top_k <= 0 else min(args.importance_top_k, n_feat)
+
+    # Optionally print the full importance ranking (useful when n_feat > plot top_k).
+    if args.print_importance_ranking:
+        order_all = np.argsort(importances)[::-1]
+        print("\n=== XGBoost feature importance ranking (descending) ===")
+        for rank, idx in enumerate(order_all, start=1):
+            print(f"{rank:>2}. {X_train.columns[idx]}: {importances[idx]:.6f}")
+
+    plot_xgb_feature_importance(
+        list(X_train.columns),
+        importances,
+        args.feature_importance_out,
+        top_k=k_plot,
+        title=(
+            f"XGBoost (GridSearchCV-tuned) — all {n_feat} features by importance"
+            if k_plot is None or k_plot == n_feat
+            else f"XGBoost (GridSearchCV-tuned) — top {k_plot} of {n_feat} features"
+        ),
+    )
+
+    print("\n=== Router baseline comparison (mid-term table) ===")
     print_results_table(rows)
+    print("XGBoost best params (GridSearchCV):", grid.best_params_)
+    print(f"\nSaved feature importance plot: {args.feature_importance_out.resolve()}")
 
 
 if __name__ == "__main__":

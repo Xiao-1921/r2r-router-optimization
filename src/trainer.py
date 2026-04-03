@@ -5,6 +5,10 @@ Loads `data/router_training_matrix.pkl` (from `prepare_dataset.py`), uses all `f
 columns to predict `target_label` (1 = model wrong → prefer RAG).
 
 Metrics: Train F1, 5-fold CV F1 (stratified, tqdm), Test F1, Test ROC-AUC.
+
+XGBoost additionally runs GridSearchCV over depth, learning rate, n_estimators, subsample,
+and L1/L2 regularization (reg_alpha / reg_lambda), saves `outputs/feature_importance.png`,
+and prints unoptimized vs tuned metrics.
 """
 
 from __future__ import annotations
@@ -22,10 +26,15 @@ from sklearn.ensemble import RandomForestClassifier
 from sklearn.impute import SimpleImputer
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import f1_score, roc_auc_score
-from sklearn.model_selection import StratifiedKFold, train_test_split
+from sklearn.model_selection import GridSearchCV, StratifiedKFold, train_test_split
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
 from tqdm import tqdm
+
+try:
+    import matplotlib.pyplot as plt
+except ImportError:  # pragma: no cover
+    plt = None  # type: ignore[assignment]
 
 warnings.filterwarnings("ignore", category=UserWarning)
 
@@ -90,6 +99,33 @@ def xgb_scale_pos_weight(y: pd.Series) -> float:
     return float(n_neg / n_pos)
 
 
+def plot_xgb_feature_importance(
+    feature_names: list[str],
+    importances: np.ndarray,
+    out_path: Path,
+    *,
+    top_k: int = 25,
+) -> None:
+    """Save a horizontal bar chart of XGBoost feature importances."""
+    if plt is None:
+        raise RuntimeError("matplotlib is required for feature importance plots: pip install matplotlib")
+
+    order = np.argsort(importances)[::-1][:top_k]
+    names = [feature_names[i] for i in order]
+    vals = importances[order]
+
+    fig, ax = plt.subplots(figsize=(10, max(4, 0.35 * len(names))))
+    ax.barh(range(len(names)), vals[::-1], color="steelblue")
+    ax.set_yticks(range(len(names)))
+    ax.set_yticklabels(names[::-1], fontsize=9)
+    ax.set_xlabel("Feature importance (XGBoost default)")
+    ax.set_title("XGBoost (tuned) — feature importance")
+    fig.tight_layout()
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(out_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+
+
 def print_results_table(rows: list[dict[str, Any]]) -> None:
     header = f"{'Strategy/Model':<34} {'Train F1':>10} {'CV F1':>10} {'Test F1':>10} {'Test AUC':>10}"
     print()
@@ -120,6 +156,12 @@ def main() -> None:
     )
     parser.add_argument("--test-size", type=float, default=0.2, help="Holdout test fraction")
     parser.add_argument("--random-state", type=int, default=42, help="Split + CV seed")
+    parser.add_argument(
+        "--feature-importance-out",
+        type=Path,
+        default=Path("outputs/feature_importance.png"),
+        help="Path for tuned XGBoost feature importance plot",
+    )
     args = parser.parse_args()
 
     df = load_training_matrix(args.data)
@@ -136,6 +178,12 @@ def main() -> None:
         test_size=args.test_size,
         random_state=args.random_state,
         stratify=y,
+    )
+
+    print(f"Loaded: {args.data} | samples={len(df)} | features={len(feat_cols)}")
+    print(
+        f"Train={len(X_train)} Test={len(X_test)} | "
+        f"pos_rate train={y_train.mean():.4f} test={y_test.mean():.4f}"
     )
 
     cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=args.random_state)
@@ -270,7 +318,7 @@ def main() -> None:
     )
 
     # -------------------------------------------------------------------------
-    # XGBoost
+    # XGBoost (unoptimized baseline — often overfits on tabular router features)
     # -------------------------------------------------------------------------
     xgb_pipe.fit(X_train, y_train)
     train_f1_xgb = f1_score(y_train, xgb_pipe.predict(X_train), zero_division=0)
@@ -279,14 +327,14 @@ def main() -> None:
         X_train,
         y_train,
         cv=cv,
-        desc="5-fold CV | XGBoost",
+        desc="5-fold CV | XGBoost (unoptimized)",
     )
     test_f1_xgb = f1_score(y_test, xgb_pipe.predict(X_test), zero_division=0)
     test_auc_xgb = safe_roc_auc(y_test.values, xgb_pipe.predict_proba(X_test)[:, 1])
 
     rows.append(
         {
-            "name": f"XGBoost (scale_pos_weight={spw:.3f})",
+            "name": f"XGBoost unopt (spw={spw:.3f})",
             "train_f1": train_f1_xgb,
             "cv_f1": cv_f1_xgb,
             "test_f1": test_f1_xgb,
@@ -294,8 +342,101 @@ def main() -> None:
         }
     )
 
-    print(f"Loaded: {args.data} | samples={len(df)} | features={len(feat_cols)}")
-    print(f"Train={len(X_train)} Test={len(X_test)} | pos_rate train={y_train.mean():.4f} test={y_test.mean():.4f}")
+    print("\n=== Baseline comparison (Always-RAG, LR, RF, XGB unoptimized) ===")
+    print_results_table(rows)
+
+    # -------------------------------------------------------------------------
+    # XGBoost hyperparameter search (GridSearchCV) + feature importance plot
+    # -------------------------------------------------------------------------
+    xgb_search_pipe = Pipeline(
+        steps=[
+            ("imputer", SimpleImputer(strategy="median")),
+            (
+                "clf",
+                XGBClassifier(
+                    random_state=args.random_state,
+                    scale_pos_weight=spw,
+                    objective="binary:logistic",
+                ),
+            ),
+        ]
+    )
+
+    param_grid: dict[str, list[Any]] = {
+        "clf__max_depth": [3, 4, 5],
+        "clf__learning_rate": [0.01, 0.1],
+        "clf__n_estimators": [100, 200],
+        "clf__subsample": [0.8],
+        "clf__reg_lambda": [0.0, 0.1, 1.0, 5.0],
+        "clf__reg_alpha": [0.0, 0.1, 1.0],
+    }
+
+    n_combos = int(np.prod([len(v) for v in param_grid.values()]))
+    print(
+        f"\nXGBoost GridSearchCV: {n_combos} param combos × 5-fold CV "
+        f"({n_combos * 5} fits) — scoring=f1 …"
+    )
+    grid = GridSearchCV(
+        estimator=xgb_search_pipe,
+        param_grid=param_grid,
+        scoring="f1",
+        cv=cv,
+        n_jobs=-1,
+        refit=True,
+        verbose=1,
+    )
+    grid.fit(X_train, y_train)
+
+    best = grid.best_estimator_
+    train_f1_xgb_t = f1_score(y_train, best.predict(X_train), zero_division=0)
+    cv_f1_xgb_t = float(grid.best_score_)
+    test_f1_xgb_t = f1_score(y_test, best.predict(X_test), zero_division=0)
+    test_auc_xgb_t = safe_roc_auc(y_test.values, best.predict_proba(X_test)[:, 1])
+
+    clf_best = best.named_steps["clf"]
+    importances = np.asarray(clf_best.feature_importances_, dtype=float)
+    plot_xgb_feature_importance(
+        list(X_train.columns),
+        importances,
+        args.feature_importance_out,
+        top_k=min(25, len(feat_cols)),
+    )
+
+    print(f"\nSaved feature importance plot: {args.feature_importance_out.resolve()}")
+
+    print("\n" + "=" * 76)
+    print("XGBoost: Unoptimized vs GridSearchCV-tuned (same train/test split)")
+    print("=" * 76)
+    cmp_rows = [
+        {
+            "name": "XGBoost unoptimized",
+            "train_f1": train_f1_xgb,
+            "cv_f1": cv_f1_xgb,
+            "test_f1": test_f1_xgb,
+            "test_auc": test_auc_xgb,
+        },
+        {
+            "name": "XGBoost tuned (best CV F1)",
+            "train_f1": train_f1_xgb_t,
+            "cv_f1": cv_f1_xgb_t,
+            "test_f1": test_f1_xgb_t,
+            "test_auc": test_auc_xgb_t,
+        },
+    ]
+    print_results_table(cmp_rows)
+    print("Best params:", grid.best_params_)
+
+    rows.append(
+        {
+            "name": "XGBoost tuned (GridSearchCV)",
+            "train_f1": train_f1_xgb_t,
+            "cv_f1": cv_f1_xgb_t,
+            "test_f1": test_f1_xgb_t,
+            "test_auc": test_auc_xgb_t,
+        }
+    )
+
+    print("\n=== Full comparison (baselines + tuned XGBoost) ===")
     print_results_table(rows)
 
 

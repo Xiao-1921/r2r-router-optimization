@@ -11,11 +11,17 @@ Inputs:
 Outputs:
   - data/router_training_matrix.pkl
   - data/router_training_matrix.csv
+  - data/router_training_matrix.feat_list.txt (sorted feat_* names, one per line)
 
 This script builds:
   - target_label: 1 if model is wrong (is_correct == False), else 0
   - Extensive linguistic features (feat_*) from the question text
   - Model-aware uncertainty features (feat_*) from inference outputs
+  - By default **22** feat_* columns (production router).
+
+Optional ablation (``--semantic-pca``): SentenceTransformer (all-MiniLM-L6-v2) + PCA to
+feat_pc_01 … feat_pc_16 → **38** feat_* total. Use a separate ``--output`` path for the
+38-feature matrix and compare with ``trainer.py`` vs the default 22-feature run.
 """
 
 from __future__ import annotations
@@ -30,6 +36,10 @@ from typing import Any
 import numpy as np
 import pandas as pd
 from tqdm import tqdm
+
+# Expected feat_* count (keep in sync with feature blocks below).
+EXPECTED_FEAT_BASE = 22
+EXPECTED_FEAT_SEMANTIC_PCA = 16
 
 
 # -----------------------------------------------------------------------------
@@ -237,12 +247,93 @@ def top5_logprob_features(lp: Any) -> dict[str, float]:
 
 
 # -----------------------------------------------------------------------------
+# Semantic embeddings + PCA (Direction 3)
+# -----------------------------------------------------------------------------
+
+
+def pca_column_names(n_components: int) -> list[str]:
+    return [f"feat_pc_{i + 1:02d}" for i in range(n_components)]
+
+
+def compute_semantic_pca_features(
+    texts: list[str],
+    target: pd.Series,
+    *,
+    model_name: str = "all-MiniLM-L6-v2",
+    n_components: int = 16,
+    pca_train_size: float = 0.8,
+    random_state: int = 42,
+    encode_batch_size: int = 32,
+    fit_on_full: bool = False,
+) -> pd.DataFrame:
+    """
+    Encode ``original_question`` texts with SentenceTransformer, then reduce to ``n_components``
+    via PCA. By default PCA is **fitted on a stratified train split** and applied to all rows.
+
+    Returns a DataFrame with columns ``feat_pc_01`` … ``feat_pc_{n_components:02d}``.
+    """
+    try:
+        from sentence_transformers import SentenceTransformer
+    except ImportError as e:  # pragma: no cover
+        raise RuntimeError(
+            "sentence-transformers is required for semantic features. "
+            "Install with `pip install sentence-transformers`."
+        ) from e
+
+    from sklearn.decomposition import PCA
+    from sklearn.model_selection import train_test_split
+
+    model = SentenceTransformer(model_name)
+    embeddings = model.encode(
+        texts,
+        batch_size=encode_batch_size,
+        show_progress_bar=True,
+        convert_to_numpy=True,
+    )
+    emb = np.asarray(embeddings, dtype=np.float32)
+    n_samples, d = emb.shape
+    if n_components > min(n_samples, d):
+        raise ValueError(
+            f"n_components={n_components} too large for n_samples={n_samples}, dim={d}."
+        )
+
+    idx = np.arange(n_samples)
+    if fit_on_full:
+        pca = PCA(n_components=n_components, random_state=random_state)
+        pca.fit(emb)
+        reduced = pca.transform(emb)
+    else:
+        idx_train, idx_test = train_test_split(
+            idx,
+            train_size=pca_train_size,
+            random_state=random_state,
+            stratify=target.astype(int).values,
+        )
+        pca = PCA(n_components=n_components, random_state=random_state)
+        pca.fit(emb[idx_train])
+        reduced = np.empty((n_samples, n_components), dtype=np.float64)
+        reduced[idx_train] = pca.transform(emb[idx_train])
+        reduced[idx_test] = pca.transform(emb[idx_test])
+
+    cols = pca_column_names(n_components)
+    return pd.DataFrame(reduced, columns=cols, index=target.index)
+
+
+# -----------------------------------------------------------------------------
 # Main
 # -----------------------------------------------------------------------------
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Prepare router training matrix from Qwen MCQ inference results")
+    parser = argparse.ArgumentParser(
+        description="Prepare router training matrix from Qwen MCQ inference results",
+        epilog=(
+            "Default: 22 feat_* columns. Ablation (38 features): "
+            "python src/prepare_dataset.py --semantic-pca "
+            "--output data/router_training_matrix_semantic.pkl\n"
+            "Full ablation train + plots in lab_outputs/: bash scripts/run_semantic_ablation.sh"
+        ),
+    )
     parser.add_argument(
         "--input",
         type=Path,
@@ -263,6 +354,44 @@ def main() -> None:
     )
     parser.add_argument("--spacy-model", default="en_core_web_sm", help="spaCy model name for NLP features")
     parser.add_argument("--spacy-batch-size", type=int, default=64, help="spaCy nlp.pipe batch size")
+    parser.add_argument(
+        "--sentence-model",
+        default="all-MiniLM-L6-v2",
+        help="sentence-transformers model for question embeddings",
+    )
+    parser.add_argument(
+        "--pca-components",
+        type=int,
+        default=16,
+        help="Number of PCA dimensions for semantic features (feat_pc_01 …)",
+    )
+    parser.add_argument(
+        "--pca-train-size",
+        type=float,
+        default=0.8,
+        help="Fraction of rows used to fit PCA (when not using --pca-fit-on full)",
+    )
+    parser.add_argument(
+        "--pca-fit-on",
+        choices=("train", "full"),
+        default="train",
+        help="Fit PCA on stratified train split (train) or on all rows (full)",
+    )
+    parser.add_argument("--pca-random-state", type=int, default=42, help="Random seed for PCA / split")
+    parser.add_argument(
+        "--encode-batch-size",
+        type=int,
+        default=32,
+        help="Batch size for SentenceTransformer.encode",
+    )
+    parser.add_argument(
+        "--semantic-pca",
+        action="store_true",
+        help=(
+            "Add 16 semantic PCA columns (feat_pc_01 …). "
+            "Without this flag, the matrix has 22 feat_* columns (default production)."
+        ),
+    )
     args = parser.parse_args()
 
     csv_path = args.csv if args.csv is not None else args.output.with_suffix(".csv")
@@ -326,8 +455,25 @@ def main() -> None:
             index=df.index,
         )
 
-    # Merge all features
-    out_df = pd.concat([df, basic_df, regex_df, spacy_df, model_aware, top5_df], axis=1)
+    # -------------------------------------------------------------------------
+    # Task 4 (optional ablation): Semantic embeddings + PCA → feat_pc_01 … feat_pc_16
+    # -------------------------------------------------------------------------
+    parts = [df, basic_df, regex_df, spacy_df, model_aware, top5_df]
+    if args.semantic_pca:
+        pca_df = compute_semantic_pca_features(
+            texts,
+            df["target_label"],
+            model_name=args.sentence_model,
+            n_components=args.pca_components,
+            pca_train_size=args.pca_train_size,
+            random_state=args.pca_random_state,
+            encode_batch_size=args.encode_batch_size,
+            fit_on_full=(args.pca_fit_on == "full"),
+        )
+        parts.append(pca_df)
+
+    # Default: 22 feat_*; with --semantic-pca: 22 + 16 = 38 feat_*
+    out_df = pd.concat(parts, axis=1)
 
     # -------------------------------------------------------------------------
     # Persist outputs
@@ -339,8 +485,20 @@ def main() -> None:
     csv_path.parent.mkdir(parents=True, exist_ok=True)
     out_df.to_csv(csv_path, index=False, encoding="utf-8")
 
-    print(f"Wrote training matrix PKL: {args.output} (rows={len(out_df)})")
+    feat_names = sorted(c for c in out_df.columns if c.startswith("feat_"))
+    n_feat = len(feat_names)
+    expected_n = EXPECTED_FEAT_BASE + (EXPECTED_FEAT_SEMANTIC_PCA if args.semantic_pca else 0)
+    if n_feat != expected_n:
+        raise RuntimeError(
+            f"feat_* count mismatch: got {n_feat}, expected {expected_n} "
+            f"(semantic_pca={args.semantic_pca}). Check feature engineering blocks."
+        )
+
+    feat_list_path = args.output.with_suffix(".feat_list.txt")
+    feat_list_path.write_text("\n".join(feat_names) + "\n", encoding="utf-8")
+    print(f"Wrote training matrix PKL: {args.output} (rows={len(out_df)}, feat_* columns={n_feat})")
     print(f"Wrote training matrix CSV: {csv_path} (rows={len(out_df)})")
+    print(f"Wrote feat_* list: {feat_list_path}")
 
 
 if __name__ == "__main__":

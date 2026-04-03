@@ -2,7 +2,8 @@
 Baseline router comparison for the R2R Router (mid-term report).
 
 Loads ``data/router_training_matrix.pkl`` (from ``prepare_dataset.py``), uses all ``feat_*``
-columns to predict ``target_label`` (1 = model answer wrong → prefer RAG).
+columns to predict ``target_label`` (1 = model answer wrong → prefer RAG). Optional
+``--exclude-feat-prefix`` drops columns (e.g. ``feat_pc_``) for ablation vs the full matrix.
 
 Reports Train F1, 5-fold stratified CV F1 (with tqdm), Test F1, and Test ROC-AUC for:
   - Always-RAG (always predict 1)
@@ -11,12 +12,15 @@ Reports Train F1, 5-fold stratified CV F1 (with tqdm), Test F1, and Test ROC-AUC
   - XGBoost tuned via GridSearchCV on the full feature matrix (scale_pos_weight from y_train)
 
 The best XGBoost pipeline from GridSearchCV is used for ``outputs/feature_importance.png``
-(all features, ranked; default top 18 bars when 18 features exist).
+(all features in the bar chart by default; override with ``--importance-top-k``).
 
 A calibration section plots reliability diagrams (``sklearn.calibration.calibration_curve``) for a
 vanilla Qwen score (``1 - chosen_token_prob`` as P(wrong)) and the tuned XGBoost router, fits
 Platt scaling via ``CalibratedClassifierCV(..., method='sigmoid')``, and reports test F1 and ECE;
-``outputs/calibration_plot.png`` stores the combined figure.
+``outputs/calibration.png`` stores the combined figure.
+
+**Production plots** (default paths): ``outputs/calibration.png``, ``outputs/feature_importance.png``.
+Semantic ablation runs should use ``lab_outputs/`` (see ``scripts/run_semantic_ablation.sh``).
 """
 
 from __future__ import annotations
@@ -58,10 +62,16 @@ def load_training_matrix(path: Path) -> pd.DataFrame:
     raise RuntimeError(f"Unsupported PKL content from {path}: {type(obj)}")
 
 
-def feat_columns(df: pd.DataFrame) -> list[str]:
+def feat_columns(df: pd.DataFrame, exclude_prefixes: list[str] | None = None) -> list[str]:
     cols = [c for c in df.columns if c.startswith("feat_")]
+    if exclude_prefixes:
+        for p in exclude_prefixes:
+            cols = [c for c in cols if not c.startswith(p)]
     if not cols:
-        raise RuntimeError("No columns starting with 'feat_' found.")
+        raise RuntimeError(
+            "No columns starting with 'feat_' found"
+            + (" after prefix exclusions." if exclude_prefixes else ".")
+        )
     return sorted(cols)
 
 
@@ -113,10 +123,10 @@ def plot_xgb_feature_importance(
     importances: np.ndarray,
     out_path: Path,
     *,
-    top_k: int | None = 18,
+    top_k: int | None = None,
     title: str = "XGBoost (GridSearchCV-tuned) — feature importance",
 ) -> None:
-    """Save a horizontal bar chart of the highest XGBoost feature importances."""
+    """Save a horizontal bar chart of XGBoost feature importances (``top_k=None`` = all features)."""
     if plt is None:
         raise RuntimeError("matplotlib is required for feature importance plots: pip install matplotlib")
 
@@ -254,13 +264,13 @@ def main() -> None:
         "--feature-importance-out",
         type=Path,
         default=Path("outputs/feature_importance.png"),
-        help="Path for tuned XGBoost feature importance plot",
+        help="Path for tuned XGBoost feature importance plot (production default under outputs/)",
     )
     parser.add_argument(
         "--importance-top-k",
         type=int,
-        default=18,
-        help="Number of features to show in the importance plot (default: 18)",
+        default=0,
+        help="Features to show in importance plot: 0 = all (default); set e.g. 18 for top-18 only",
     )
     parser.add_argument(
         "--print-importance-ranking",
@@ -270,8 +280,8 @@ def main() -> None:
     parser.add_argument(
         "--calibration-out",
         type=Path,
-        default=Path("outputs/calibration_plot.png"),
-        help="Reliability diagram output path",
+        default=Path("outputs/calibration.png"),
+        help="Reliability diagram output path (production default: outputs/calibration.png)",
     )
     parser.add_argument(
         "--calibration-bins",
@@ -285,13 +295,24 @@ def main() -> None:
         default=3,
         help="Folds inside CalibratedClassifierCV (Platt / sigmoid)",
     )
+    parser.add_argument(
+        "--exclude-feat-prefix",
+        action="append",
+        default=[],
+        metavar="PREFIX",
+        help=(
+            "Drop feat_* columns whose name starts with PREFIX (repeatable). "
+            "Example for semantic ablation: --exclude-feat-prefix feat_pc_"
+        ),
+    )
     args = parser.parse_args()
 
     df = load_training_matrix(args.data)
     if "target_label" not in df.columns:
         raise RuntimeError("Column 'target_label' missing. Run prepare_dataset.py first.")
 
-    feat_cols = feat_columns(df)
+    excl = args.exclude_feat_prefix if args.exclude_feat_prefix else None
+    feat_cols = feat_columns(df, exclude_prefixes=excl)
     X = df[feat_cols].apply(pd.to_numeric, errors="coerce")
     y = df["target_label"].astype(int)
 
@@ -308,8 +329,13 @@ def main() -> None:
     y_test = y.iloc[idx_test]
 
     print(f"Loaded: {args.data} | samples={len(df)} | features={len(feat_cols)}")
+    if excl:
+        print(f"  Excluded feat_* prefixes: {excl}")
+    print("\n=== feat_* columns used in this run (sorted) ===")
+    for c in feat_cols:
+        print(f"  {c}")
     print(
-        f"Train={len(X_train)} Test={len(X_test)} | "
+        f"\nTrain={len(X_train)} Test={len(X_test)} | "
         f"pos_rate train={y_train.mean():.4f} test={y_test.mean():.4f}"
     )
 
@@ -553,6 +579,10 @@ def main() -> None:
             else f"XGBoost (GridSearchCV-tuned) — top {k_plot} of {n_feat} features"
         ),
     )
+
+    feat_list_trainer_path = args.feature_importance_out.with_suffix(".feat_list.txt")
+    feat_list_trainer_path.write_text("\n".join(feat_cols) + "\n", encoding="utf-8")
+    print(f"Wrote feature list for this run: {feat_list_trainer_path.resolve()}")
 
     print("\n=== Router baseline comparison (mid-term table) ===")
     print_results_table(rows)

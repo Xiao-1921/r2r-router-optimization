@@ -29,3 +29,6 @@ Thumbs.db
 # Keep the 'outputs/' directory for reports and plots
 !outputs/
 !outputs/**/.gitkeep
+
+# Slurm / cluster logs
+logs/

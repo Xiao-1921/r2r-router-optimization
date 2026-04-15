@@ -1,9 +1,18 @@
 """
-Qwen2.5-3B-Instruct MCQ inference on Apple Silicon (MPS) with token logprobs,
-entropy, perplexity, and the top-5 first-token log-probabilities (for margins / kurtosis).
+Qwen2.5 Instruct MCQ inference with token logprobs, entropy, perplexity, and the top-5
+first-token log-probabilities (for margins / kurtosis).
 
-Uses the tokenizer's built-in Qwen2.5 chat template (apply_chat_template).
+Supports **CPU**, **Apple Silicon MPS**, and **NVIDIA CUDA** (e.g. USC CARC GPU nodes).
+Uses the tokenizer's built-in Qwen2.5 chat template (``apply_chat_template``).
 Loads MCQ items from CSV (``data/raw`` by convention) via :func:`pandas.read_csv`.
+
+Output layout (deterministic, no cross-split or cross-model overwrites):
+
+- ``data/processed/{model_name}/inference_results_{split}.pkl`` and ``.csv``
+- ``{split}`` comes from the CSV ``split`` column when present, else from the input
+  filename stem (e.g. ``Train.csv`` → ``train``, ``Validation.csv`` → ``validation``).
+- Different ``--model_name`` values (e.g. ``qwen2.5-3b`` vs ``qwen2.5-7b``) use separate
+  directories under ``data/processed/``.
 """
 
 from __future__ import annotations
@@ -11,6 +20,7 @@ from __future__ import annotations
 import argparse
 import ast
 import json
+import os
 import pickle
 import re
 from pathlib import Path
@@ -23,6 +33,42 @@ from tqdm import tqdm
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from mps_gpu_check import verify_mps_gpu_ready
+
+# -----------------------------------------------------------------------------
+# Device & dtype (CPU / MPS / CUDA)
+# -----------------------------------------------------------------------------
+
+
+def resolve_torch_dtype(device_type: str) -> torch.dtype:
+    """Dtypes aligned with backend: bf16 (MPS), fp16 (CUDA), fp32 (CPU)."""
+    if device_type == "mps":
+        return torch.bfloat16
+    if device_type == "cuda":
+        return torch.float16
+    return torch.float32
+
+
+def resolve_device(device_arg: str) -> torch.device:
+    """
+    Map CLI ``--device`` to a :class:`torch.device` with explicit availability checks.
+    """
+    if device_arg == "cuda":
+        if not torch.cuda.is_available():
+            raise RuntimeError(
+                "CUDA was requested (--device cuda) but torch.cuda.is_available() is False. "
+                "Run on a GPU node, use a CUDA-enabled PyTorch build, and ensure the GPU is "
+                "visible (e.g. CUDA_VISIBLE_DEVICES, Slurm --gres)."
+            )
+        return torch.device("cuda")
+    if device_arg == "mps":
+        if not torch.backends.mps.is_available():
+            raise RuntimeError(
+                "MPS was requested (--device mps) but it is not available. "
+                "Use an Apple Silicon Mac with PyTorch MPS, or pass --device cpu / --device cuda."
+            )
+        return torch.device("mps")
+    return torch.device("cpu")
+
 
 # -----------------------------------------------------------------------------
 # Data loading & prompt construction
@@ -308,7 +354,9 @@ def build_prompt(tokenizer: AutoTokenizer, user_content: str) -> str:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Qwen2.5 MCQ inference with MPS + uncertainty metrics")
+    parser = argparse.ArgumentParser(
+        description="Qwen2.5 MCQ inference (CPU / MPS / CUDA) with uncertainty metrics"
+    )
     parser.add_argument(
         "--model_name",
         type=str,
@@ -356,9 +404,9 @@ def main() -> None:
     parser.add_argument("--limit", type=int, default=None, help="Only first N items (debug)")
     parser.add_argument(
         "--device",
-        choices=("mps", "cpu"),
+        choices=("mps", "cpu", "cuda"),
         default="mps",
-        help="Inference device (default: mps for Apple Silicon)",
+        help="Inference device: mps (Apple Silicon), cuda (NVIDIA GPU), or cpu.",
     )
     args = parser.parse_args()
 
@@ -369,7 +417,21 @@ def main() -> None:
     except OSError as exc:
         raise RuntimeError(f"Could not create output directory {out_dir}: {exc}") from exc
 
+    hf_home = os.environ.get("HF_HOME", "")
+    print(
+        "[startup] MCQ inference\n"
+        f"  input_path:    {args.input_path.resolve()}\n"
+        f"  output_dir:    {out_dir.resolve()}\n"
+        f"  model_name:    {model_dir!r}\n"
+        f"  hf_model_id:   {args.hf_model_id!r}\n"
+        f"  device (CLI):  {args.device!r}\n"
+        f"  HF_HOME:       {hf_home or '(unset; Hugging Face default cache paths)'}"
+    )
+
     data, split_tag = load_mcq_csv(args.input_path, split=args.split)
+    if args.limit is not None:
+        data = data[: args.limit]
+
     if args.output_stem:
         stem = args.output_stem.strip()
         if not stem:
@@ -382,48 +444,39 @@ def main() -> None:
 
     pkl_path = out_dir / f"{stem}.pkl"
     csv_path = args.csv if args.csv is not None else out_dir / f"{stem}.csv"
+    # Distinct stems per split file (train / validation / test) and per --model_name dir — no overwrites.
     print(
-        f"Loading MCQ CSV: {args.input_path.resolve()} | "
-        f"model_name={model_dir!r} | artifacts: {pkl_path.name}, {csv_path.name} -> {out_dir.resolve()}"
+        f"  output_stem:   {stem!r}  →  {pkl_path.name}, {csv_path.name}\n"
+        f"  inference rows: {len(data)}"
+        + ("  (--limit applied)" if args.limit is not None else "")
     )
 
     # -------------------------------------------------------------------------
-    # Device selection (MPS on Apple Silicon, or CPU for debugging)
+    # Device selection: CUDA (HPC), MPS (Mac), or CPU
     # -------------------------------------------------------------------------
-    if args.device == "mps":
-        if not torch.backends.mps.is_available():
-            raise RuntimeError(
-                "MPS is not available. Use --device cpu for non-Mac testing, "
-                "or run on an Apple Silicon Mac with PyTorch MPS enabled."
-            )
-        device = torch.device("mps")
-        # ---------------------------------------------------------------------
-        # Confirm MPS (Metal GPU) is usable before loading the model
-        # ---------------------------------------------------------------------
+    device = resolve_device(args.device)
+    if device.type == "mps":
         verify_mps_gpu_ready()
-    else:
-        device = torch.device("cpu")
+
+    torch_dtype = resolve_torch_dtype(device.type)
+    print(
+        f"[device] Using {device!s} | torch_dtype={torch_dtype} | "
+        f"CUDA available={torch.cuda.is_available()}"
+    )
 
     # -------------------------------------------------------------------------
-    # Model & tokenizer (bf16 on MPS, float32 on CPU)
+    # Model & tokenizer (dtype by device: bf16 MPS, fp16 CUDA, fp32 CPU)
     # -------------------------------------------------------------------------
     tokenizer = AutoTokenizer.from_pretrained(args.hf_model_id, trust_remote_code=True)
     if tokenizer.pad_token_id is None:
         tokenizer.pad_token_id = tokenizer.eos_token_id
-    torch_dtype = torch.bfloat16 if device.type == "mps" else torch.float32
     model = AutoModelForCausalLM.from_pretrained(
         args.hf_model_id,
-        dtype=torch_dtype,
+        torch_dtype=torch_dtype,
         trust_remote_code=True,
     )
     model.to(device)
     model.eval()
-
-    # -------------------------------------------------------------------------
-    # Dataset (optional truncation via --limit)
-    # -------------------------------------------------------------------------
-    if args.limit is not None:
-        data = data[: args.limit]
 
     results: list[dict[str, Any]] = []
 
@@ -492,7 +545,7 @@ def main() -> None:
             pickle.dump(results, f)
     except OSError as exc:
         raise RuntimeError(f"Failed to write pickle results to {pkl_path}: {exc}") from exc
-    print(f"Wrote {len(results)} records to {pkl_path}")
+    print(f"Wrote {len(results)} records to {pkl_path.resolve()}")
 
     df = pd.DataFrame(results)
     try:
@@ -503,7 +556,7 @@ def main() -> None:
         df_csv.to_csv(csv_path, index=False, encoding="utf-8")
     except OSError as exc:
         raise RuntimeError(f"Failed to write CSV results to {csv_path}: {exc}") from exc
-    print(f"Wrote {len(df)} rows to {csv_path}")
+    print(f"Wrote {len(df)} rows to {csv_path.resolve()}")
 
 
 if __name__ == "__main__":

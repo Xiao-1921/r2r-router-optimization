@@ -2,16 +2,15 @@
 Prepare router training matrix for R2R-Router.
 
 Inputs:
-  - data/qwen_mcq_results.pkl
+  - Inference PKL under ``data/processed/{model_name}/`` (from ``inference_qwen_mcq.py``).
     Expected keys per record:
       original_question, is_correct,
       first_token_entropy, avg_entropy, perplexity, chosen_token_prob,
       first_token_top5_logprobs (list of 5 floats, descending, nats)
 
 Outputs:
-  - data/router_training_matrix.pkl
-  - data/router_training_matrix.csv
-  - data/router_training_matrix.feat_list.txt (sorted feat_* names, one per line)
+  - ``{output_dir}/router_training_matrix[_{split}].pkl``
+  - matching ``.csv`` and ``.feat_list.txt`` (sorted feat_* names, one per line)
 
 This script builds:
   - target_label: 1 if model is wrong (is_correct == False), else 0
@@ -40,6 +39,13 @@ from tqdm import tqdm
 # Expected feat_* count (keep in sync with feature blocks below).
 EXPECTED_FEAT_BASE = 22
 EXPECTED_FEAT_SEMANTIC_PCA = 16
+
+
+def _sanitize_model_dirname(model_name: str) -> str:
+    cleaned = model_name.strip().replace("/", "_").replace("\\", "_")
+    if not cleaned:
+        raise ValueError("model_name must be a non-empty string after sanitization.")
+    return cleaned
 
 
 # -----------------------------------------------------------------------------
@@ -330,27 +336,45 @@ def main() -> None:
         epilog=(
             "Default: 22 feat_* columns. Ablation (38 features): "
             "python src/prepare_dataset.py --semantic-pca "
-            "--output data/router_training_matrix_semantic.pkl\n"
+            "--output_stem router_training_matrix_semantic\n"
             "Full ablation train + plots in lab_outputs/: bash scripts/run_semantic_ablation.sh"
         ),
     )
     parser.add_argument(
-        "--input",
-        type=Path,
-        default=Path("data/qwen_mcq_results.pkl"),
-        help="Input inference results PKL path",
+        "--model_name",
+        type=str,
+        default="qwen2.5-3b",
+        help="Short model tag; defaults align paths under data/processed/{model_name}/.",
     )
     parser.add_argument(
-        "--output",
+        "--input_path",
         type=Path,
-        default=Path("data/router_training_matrix.pkl"),
-        help="Output training matrix PKL path",
+        default=None,
+        help="Input inference results PKL (defaults under output_dir based on --split).",
+    )
+    parser.add_argument(
+        "--output_dir",
+        type=Path,
+        default=None,
+        help="Directory for training matrix PKL/CSV/feat_list (default: data/processed/{model_name}/).",
+    )
+    parser.add_argument(
+        "--split",
+        type=str,
+        default=None,
+        help="Optional split tag appended to default filenames (e.g. train → router_training_matrix_train.pkl).",
+    )
+    parser.add_argument(
+        "--output_stem",
+        type=str,
+        default=None,
+        help="Override output basename without extension (default: router_training_matrix[_split]).",
     )
     parser.add_argument(
         "--csv",
         type=Path,
         default=None,
-        help="Output CSV path (default: same basename as --output with .csv extension)",
+        help="Output CSV path (defaults alongside the PKL basename in output_dir)",
     )
     parser.add_argument("--spacy-model", default="en_core_web_sm", help="spaCy model name for NLP features")
     parser.add_argument("--spacy-batch-size", type=int, default=64, help="spaCy nlp.pipe batch size")
@@ -394,13 +418,43 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    csv_path = args.csv if args.csv is not None else args.output.with_suffix(".csv")
+    model_dir = _sanitize_model_dirname(args.model_name)
+    out_dir = Path(args.output_dir) if args.output_dir is not None else Path("data/processed") / model_dir
+    try:
+        out_dir.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        raise RuntimeError(f"Could not create output directory {out_dir}: {exc}") from exc
+
+    in_path = args.input_path
+    if in_path is None:
+        if args.split:
+            in_path = out_dir / f"inference_results_{args.split.strip().lower()}.pkl"
+        else:
+            in_path = out_dir / "inference_results.pkl"
+
+    if args.output_stem:
+        stem = args.output_stem.strip()
+        if not stem:
+            raise ValueError("--output_stem must be non-empty when provided.")
+    elif args.split:
+        stem = f"router_training_matrix_{args.split.strip().lower()}"
+    else:
+        stem = "router_training_matrix"
+
+    out_pkl = out_dir / f"{stem}.pkl"
+    csv_path = args.csv if args.csv is not None else out_dir / f"{stem}.csv"
+    print(f"Loading inference PKL: {in_path.resolve()} | Writing matrix stem={stem!r} -> {out_dir.resolve()}")
 
     # -------------------------------------------------------------------------
     # Load inference results
     # -------------------------------------------------------------------------
-    with open(args.input, "rb") as f:
-        records = pickle.load(f)
+    try:
+        with open(in_path, "rb") as f:
+            records = pickle.load(f)
+    except FileNotFoundError as exc:
+        raise FileNotFoundError(f"Inference PKL not found: {in_path.resolve()}") from exc
+    except OSError as exc:
+        raise RuntimeError(f"Failed to read inference PKL {in_path}: {exc}") from exc
     if not isinstance(records, list) or (len(records) > 0 and not isinstance(records[0], dict)):
         raise RuntimeError("Expected input PKL to be a list[dict].")
 
@@ -478,12 +532,18 @@ def main() -> None:
     # -------------------------------------------------------------------------
     # Persist outputs
     # -------------------------------------------------------------------------
-    args.output.parent.mkdir(parents=True, exist_ok=True)
-    with open(args.output, "wb") as f:
-        pickle.dump(out_df, f)
+    try:
+        out_pkl.parent.mkdir(parents=True, exist_ok=True)
+        with open(out_pkl, "wb") as f:
+            pickle.dump(out_df, f)
+    except OSError as exc:
+        raise RuntimeError(f"Failed to write training matrix PKL {out_pkl}: {exc}") from exc
 
-    csv_path.parent.mkdir(parents=True, exist_ok=True)
-    out_df.to_csv(csv_path, index=False, encoding="utf-8")
+    try:
+        csv_path.parent.mkdir(parents=True, exist_ok=True)
+        out_df.to_csv(csv_path, index=False, encoding="utf-8")
+    except OSError as exc:
+        raise RuntimeError(f"Failed to write training matrix CSV {csv_path}: {exc}") from exc
 
     feat_names = sorted(c for c in out_df.columns if c.startswith("feat_"))
     n_feat = len(feat_names)
@@ -494,9 +554,12 @@ def main() -> None:
             f"(semantic_pca={args.semantic_pca}). Check feature engineering blocks."
         )
 
-    feat_list_path = args.output.with_suffix(".feat_list.txt")
-    feat_list_path.write_text("\n".join(feat_names) + "\n", encoding="utf-8")
-    print(f"Wrote training matrix PKL: {args.output} (rows={len(out_df)}, feat_* columns={n_feat})")
+    feat_list_path = out_pkl.with_suffix(".feat_list.txt")
+    try:
+        feat_list_path.write_text("\n".join(feat_names) + "\n", encoding="utf-8")
+    except OSError as exc:
+        raise RuntimeError(f"Failed to write feature list {feat_list_path}: {exc}") from exc
+    print(f"Wrote training matrix PKL: {out_pkl} (rows={len(out_df)}, feat_* columns={n_feat})")
     print(f"Wrote training matrix CSV: {csv_path} (rows={len(out_df)})")
     print(f"Wrote feat_* list: {feat_list_path}")
 

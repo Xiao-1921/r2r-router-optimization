@@ -1,9 +1,14 @@
 """
 Baseline router comparison for the R2R Router (mid-term report).
 
-Loads ``data/router_training_matrix.pkl`` (from ``prepare_dataset.py``), uses all ``feat_*``
-columns to predict ``target_label`` (1 = model answer wrong → prefer RAG). Optional
-``--exclude-feat-prefix`` drops columns (e.g. ``feat_pc_``) for ablation vs the full matrix.
+Loads a training matrix PKL from ``prepare_dataset.py`` (by default under
+``data/processed/{model_name}/``), uses all ``feat_*`` columns to predict ``target_label``
+(1 = model answer wrong → prefer RAG). Optional ``--exclude-feat-prefix`` drops columns
+(e.g. ``feat_pc_``) for ablation vs the full matrix.
+
+When ``--test_input_path`` is set, that matrix is used as a held-out test set and
+``--input_path`` is treated as the full training pool (no random test split from the
+training file). Otherwise a stratified train/test split is drawn from ``--input_path``.
 
 Reports Train F1, 5-fold stratified CV F1 (with tqdm), Test F1, and Test ROC-AUC for:
   - Always-RAG (always predict 1)
@@ -11,16 +16,10 @@ Reports Train F1, 5-fold stratified CV F1 (with tqdm), Test F1, and Test ROC-AUC
   - Random Forest (class_weight='balanced')
   - XGBoost tuned via GridSearchCV on the full feature matrix (scale_pos_weight from y_train)
 
-The best XGBoost pipeline from GridSearchCV is used for ``outputs/feature_importance.png``
-(all features in the bar chart by default; override with ``--importance-top-k``).
-
-A calibration section plots reliability diagrams (``sklearn.calibration.calibration_curve``) for a
-vanilla Qwen score (``1 - chosen_token_prob`` as P(wrong)) and the tuned XGBoost router, fits
-Platt scaling via ``CalibratedClassifierCV(..., method='sigmoid')``, and reports test F1 and ECE;
-``outputs/calibration.png`` stores the combined figure.
-
-**Production plots** (default paths): ``outputs/calibration.png``, ``outputs/feature_importance.png``.
-Semantic ablation runs should use ``lab_outputs/`` (see ``scripts/run_semantic_ablation.sh``).
+Training and test matrices are read from ``data/processed/{model_name}/`` by default
+(``--data_dir`` / ``--input_path``). Visual outputs (``calibration.png``, ``feature_importance.png``,
+and ``feature_importance.feat_list.txt``) go under ``outputs/{model_name}/`` (``--reports_dir``).
+The tuned XGBoost pipeline is saved to ``models/{model_name}/router_model.joblib``.
 """
 
 from __future__ import annotations
@@ -28,6 +27,8 @@ from __future__ import annotations
 import argparse
 import pickle
 import warnings
+
+import joblib
 from pathlib import Path
 from typing import Any
 
@@ -52,9 +53,21 @@ except ImportError:  # pragma: no cover
 warnings.filterwarnings("ignore", category=UserWarning)
 
 
+def _sanitize_model_dirname(model_name: str) -> str:
+    cleaned = model_name.strip().replace("/", "_").replace("\\", "_")
+    if not cleaned:
+        raise ValueError("model_name must be a non-empty string after sanitization.")
+    return cleaned
+
+
 def load_training_matrix(path: Path) -> pd.DataFrame:
-    with open(path, "rb") as f:
-        obj = pickle.load(f)
+    try:
+        with open(path, "rb") as f:
+            obj = pickle.load(f)
+    except FileNotFoundError as exc:
+        raise FileNotFoundError(f"Training matrix PKL not found: {path.resolve()}") from exc
+    except OSError as exc:
+        raise RuntimeError(f"Failed to read PKL {path}: {exc}") from exc
     if isinstance(obj, pd.DataFrame):
         return obj
     if isinstance(obj, list) and (len(obj) == 0 or isinstance(obj[0], dict)):
@@ -92,7 +105,7 @@ def cross_val_f1_stratified(
     X: pd.DataFrame,
     y: pd.Series,
     *,
-    cv: StratifiedKFold,
+    cv: Any,
     desc: str,
 ) -> float:
     """5-fold stratified CV mean F1 with tqdm over folds."""
@@ -253,18 +266,54 @@ def print_results_table(rows: list[dict[str, Any]]) -> None:
 def main() -> None:
     parser = argparse.ArgumentParser(description="Baseline router training / comparison")
     parser.add_argument(
-        "--data",
-        type=Path,
-        default=Path("data/router_training_matrix.pkl"),
-        help="PKL from prepare_dataset.py (DataFrame)",
+        "--model_name",
+        type=str,
+        default="qwen2.5-3b",
+        help="Short model tag for paths: data/processed/, outputs/, and models/ subfolders.",
     )
-    parser.add_argument("--test-size", type=float, default=0.2, help="Holdout test fraction")
+    parser.add_argument(
+        "--input_path",
+        type=Path,
+        default=None,
+        help="Training matrix PKL from prepare_dataset.py (default under data/processed/{model_name}/).",
+    )
+    parser.add_argument(
+        "--test_input_path",
+        type=Path,
+        default=None,
+        help="Optional separate test matrix PKL; when set, no random split is taken from the training file.",
+    )
+    parser.add_argument(
+        "--data_dir",
+        type=Path,
+        default=None,
+        help="Directory for default --input_path only (default: data/processed/{model_name}/).",
+    )
+    parser.add_argument(
+        "--reports_dir",
+        type=Path,
+        default=None,
+        help="Directory for calibration/feature importance PNGs and feat_list (default: outputs/{model_name}/).",
+    )
+    parser.add_argument(
+        "--output_dir",
+        type=Path,
+        default=None,
+        help="Deprecated: same as --reports_dir when --reports_dir is not set. Prefer --reports_dir.",
+    )
+    parser.add_argument(
+        "--model_output_path",
+        type=Path,
+        default=None,
+        help="Path for saved router pipeline (default: models/{model_name}/router_model.joblib).",
+    )
+    parser.add_argument("--test-size", type=float, default=0.2, help="Holdout test fraction (ignored if --test_input_path is set)")
     parser.add_argument("--random-state", type=int, default=42, help="Split + CV seed")
     parser.add_argument(
         "--feature-importance-out",
         type=Path,
-        default=Path("outputs/feature_importance.png"),
-        help="Path for tuned XGBoost feature importance plot (production default under outputs/)",
+        default=None,
+        help="Path for tuned XGBoost feature importance plot (default under --reports_dir)",
     )
     parser.add_argument(
         "--importance-top-k",
@@ -280,8 +329,8 @@ def main() -> None:
     parser.add_argument(
         "--calibration-out",
         type=Path,
-        default=Path("outputs/calibration.png"),
-        help="Reliability diagram output path (production default: outputs/calibration.png)",
+        default=None,
+        help="Reliability diagram output path (default under --reports_dir)",
     )
     parser.add_argument(
         "--calibration-bins",
@@ -307,28 +356,91 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    df = load_training_matrix(args.data)
-    if "target_label" not in df.columns:
-        raise RuntimeError("Column 'target_label' missing. Run prepare_dataset.py first.")
+    model_dir = _sanitize_model_dirname(args.model_name)
+    data_dir = Path(args.data_dir) if args.data_dir is not None else Path("data/processed") / model_dir
+
+    if args.reports_dir is not None:
+        reports_dir = Path(args.reports_dir)
+    elif args.output_dir is not None:
+        reports_dir = Path(args.output_dir)
+        print(
+            "[trainer] Note: --output_dir is deprecated for visual outputs; use --reports_dir "
+            f"(currently using {reports_dir})."
+        )
+    else:
+        reports_dir = Path("outputs") / model_dir
+
+    models_dir = Path("models") / model_dir
+    model_save_path = (
+        Path(args.model_output_path) if args.model_output_path is not None else models_dir / "router_model.joblib"
+    )
+
+    try:
+        reports_dir.mkdir(parents=True, exist_ok=True)
+        model_save_path.parent.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        raise RuntimeError(
+            f"Could not create directory for reports or model weights: {exc}"
+        ) from exc
+
+    train_path = args.input_path if args.input_path is not None else data_dir / "router_training_matrix.pkl"
+    feat_importance_path = (
+        args.feature_importance_out
+        if args.feature_importance_out is not None
+        else reports_dir / "feature_importance.png"
+    )
+    calibration_path = args.calibration_out if args.calibration_out is not None else reports_dir / "calibration.png"
+
+    print(
+        f"Paths | data (matrices): {data_dir.resolve()} | "
+        f"reports: {reports_dir.resolve()} | "
+        f"model save: {model_save_path.resolve()}"
+    )
+
+    df_train_full = load_training_matrix(train_path)
+    if "target_label" not in df_train_full.columns:
+        raise RuntimeError("Column 'target_label' missing in training matrix. Run prepare_dataset.py first.")
 
     excl = args.exclude_feat_prefix if args.exclude_feat_prefix else None
-    feat_cols = feat_columns(df, exclude_prefixes=excl)
-    X = df[feat_cols].apply(pd.to_numeric, errors="coerce")
-    y = df["target_label"].astype(int)
+    feat_cols = feat_columns(df_train_full, exclude_prefixes=excl)
 
-    idx_all = np.arange(len(df))
-    idx_train, idx_test = train_test_split(
-        idx_all,
-        test_size=args.test_size,
-        random_state=args.random_state,
-        stratify=y,
-    )
-    X_train = X.iloc[idx_train]
-    X_test = X.iloc[idx_test]
-    y_train = y.iloc[idx_train]
-    y_test = y.iloc[idx_test]
+    external_test = args.test_input_path is not None
+    if external_test:
+        df_test_full = load_training_matrix(args.test_input_path)
+        if "target_label" not in df_test_full.columns:
+            raise RuntimeError("Column 'target_label' missing in test matrix PKL.")
+        missing_test = [c for c in feat_cols if c not in df_test_full.columns]
+        if missing_test:
+            raise RuntimeError(
+                f"Test matrix missing feat_* columns present in training data: {missing_test[:10]}"
+                f"{' ...' if len(missing_test) > 10 else ''}"
+            )
+        X_train = df_train_full[feat_cols].apply(pd.to_numeric, errors="coerce")
+        y_train = df_train_full["target_label"].astype(int)
+        X_test = df_test_full[feat_cols].apply(pd.to_numeric, errors="coerce")
+        y_test = df_test_full["target_label"].astype(int)
+        df_test_for_calib = df_test_full
+        print(
+            f"Loaded train: {train_path} | samples={len(df_train_full)} | "
+            f"Loaded test: {args.test_input_path} | samples={len(df_test_full)} | features={len(feat_cols)}"
+        )
+    else:
+        X = df_train_full[feat_cols].apply(pd.to_numeric, errors="coerce")
+        y = df_train_full["target_label"].astype(int)
+        idx_all = np.arange(len(df_train_full))
+        idx_train, idx_test = train_test_split(
+            idx_all,
+            test_size=args.test_size,
+            random_state=args.random_state,
+            stratify=y,
+        )
+        X_train = X.iloc[idx_train]
+        X_test = X.iloc[idx_test]
+        y_train = y.iloc[idx_train]
+        y_test = y.iloc[idx_test]
+        df_test_for_calib = df_train_full.iloc[idx_test]
+        print(f"Loaded: {train_path} | samples={len(df_train_full)} | features={len(feat_cols)}")
 
-    print(f"Loaded: {args.data} | samples={len(df)} | features={len(feat_cols)}")
     if excl:
         print(f"  Excluded feat_* prefixes: {excl}")
     print("\n=== feat_* columns used in this run (sorted) ===")
@@ -498,6 +610,12 @@ def main() -> None:
     grid.fit(X_train, y_train)
 
     best = grid.best_estimator_
+    try:
+        joblib.dump(best, model_save_path)
+    except OSError as exc:
+        raise RuntimeError(f"Failed to write router model to {model_save_path}: {exc}") from exc
+    print(f"Saved router pipeline (GridSearchCV best estimator): {model_save_path.resolve()}")
+
     train_f1_xgb_t = f1_score(y_train, best.predict(X_train), zero_division=0)
     cv_f1_xgb_t = float(grid.best_score_)
     test_f1_xgb_t = f1_score(y_test, best.predict(X_test), zero_division=0)
@@ -521,8 +639,8 @@ def main() -> None:
 
     calibration_series: dict[str, np.ndarray] = {}
 
-    if "chosen_token_prob" in df.columns:
-        cp_test = df.iloc[idx_test]["chosen_token_prob"].astype(float).values
+    if "chosen_token_prob" in df_test_for_calib.columns:
+        cp_test = df_test_for_calib["chosen_token_prob"].astype(float).values
         prob_vanilla = np.clip(1.0 - cp_test, 1e-7, 1.0 - 1e-7)
         calibration_series["Vanilla Qwen (1 − p_first token)"] = prob_vanilla
     else:
@@ -551,10 +669,10 @@ def main() -> None:
     plot_calibration_reliability(
         y_test_arr,
         calibration_series,
-        args.calibration_out,
+        calibration_path,
         n_bins=args.calibration_bins,
     )
-    print(f"\nSaved calibration plot: {args.calibration_out.resolve()}")
+    print(f"\nSaved calibration plot: {calibration_path.resolve()}")
 
     clf_best = best.named_steps["clf"]
     importances = np.asarray(clf_best.feature_importances_, dtype=float)
@@ -571,7 +689,7 @@ def main() -> None:
     plot_xgb_feature_importance(
         list(X_train.columns),
         importances,
-        args.feature_importance_out,
+        feat_importance_path,
         top_k=k_plot,
         title=(
             f"XGBoost (GridSearchCV-tuned) — all {n_feat} features by importance"
@@ -580,14 +698,17 @@ def main() -> None:
         ),
     )
 
-    feat_list_trainer_path = args.feature_importance_out.with_suffix(".feat_list.txt")
-    feat_list_trainer_path.write_text("\n".join(feat_cols) + "\n", encoding="utf-8")
+    feat_list_trainer_path = feat_importance_path.with_suffix(".feat_list.txt")
+    try:
+        feat_list_trainer_path.write_text("\n".join(feat_cols) + "\n", encoding="utf-8")
+    except OSError as exc:
+        raise RuntimeError(f"Failed to write feature list {feat_list_trainer_path}: {exc}") from exc
     print(f"Wrote feature list for this run: {feat_list_trainer_path.resolve()}")
 
     print("\n=== Router baseline comparison (mid-term table) ===")
     print_results_table(rows)
     print("XGBoost best params (GridSearchCV):", grid.best_params_)
-    print(f"\nSaved feature importance plot: {args.feature_importance_out.resolve()}")
+    print(f"\nSaved feature importance plot: {feat_importance_path.resolve()}")
 
 
 if __name__ == "__main__":

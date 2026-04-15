@@ -1,18 +1,31 @@
-# Python
+# Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]
 *$py.class
+
+# Environments
+.venv/
 venv/
+env/
 .env
 
-# Data and Models (Usually kept locally or in LFS)
-data/*
-!data/.gitkeep
-models/*.pkl
-models/*.joblib
-temp/*
+# --- Data and Artifacts ---
+# Ignore intermediate/binary files (Logprobs and Matrices)
+data/processed/
 
-# Cursor/IDE
-.cursor/
-.vscode/
+# UPLOAD RAW DATA for CARC
+# So we do NOT ignore data/raw/
+!data/raw/
+
+# --- Models ---
+# Ignore model weights as they can be large and binary
+models/
+
+# --- OS files ---
 .DS_Store
+Thumbs.db
+
+# --- Outputs ---
+# Keep the 'outputs/' directory for reports and plots
+!outputs/
+!outputs/**/.gitkeep

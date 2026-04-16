@@ -31,4 +31,4 @@ Thumbs.db
 !outputs/**/.gitkeep
 
 # Slurm / cluster logs
-logs/
+logs/venv_carc/

@@ -6,10 +6,10 @@
 #
 #SBATCH --job-name=qwen25-3b-mcq
 #SBATCH --partition=gpu
-#SBATCH --gres=gpu:p100:1
+#SBATCH --gres=gpu:v100:1
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=48G
-#SBATCH --time=06:00:00
+#SBATCH --time=04:00:00
 #SBATCH --account=robinjia_1822
 #SBATCH --output=logs/%x-%j.out
 #SBATCH --error=logs/%x-%j.err

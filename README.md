@@ -99,3 +99,44 @@ The project generates results in three stages:
 3. `src/trainer.py` trains and compares routing baselines, including Logistic Regression, Random Forest, and a tuned XGBoost router. It evaluates them with F1 and ROC-AUC, produces the calibration and feature-importance figures, and saves the best router model.
 
 In short, the final reported outputs come from predicting when the base LLM is likely to fail, so the router can decide when retrieval should be triggered.
+
+## Running 14B and 32B on USC CARC
+
+Parth Gosar extended the pipeline to Qwen2.5-14B-Instruct and Qwen2.5-32B-Instruct. Submit from the repo root after activating the venv:
+
+```bash
+source venv_carc/bin/activate
+```
+
+### Step 1 — Inference
+
+**14B** (~10 hrs for Train split, runs on V100):
+```bash
+sbatch scripts/run_qwen_14b.slurm
+```
+
+**32B** (~3 hrs per split, uses 4-bit quantization on p100:2):
+```bash
+sbatch scripts/run_qwen_32b.slurm
+```
+
+> Note: For 32B, set `HF_HOME` to a scratch directory to avoid home quota issues:
+> `export HF_HOME=/scratch1/<your_username>/hf_cache`
+
+Outputs: `data/processed/qwen2.5-{14B,32B}/inference_results_{train,validation,test}.{pkl,csv}`
+
+### Step 2 — Feature Engineering
+```bash
+sbatch scripts/prepare_dataset_14b.sh
+sbatch scripts/prepare_dataset_32b.sh
+```
+
+Outputs: `data/processed/qwen2.5-{14B,32B}/router_training_matrix_{split}.{pkl,csv}`
+
+### Step 3 — Router Training
+```bash
+sbatch scripts/trainer_14b.sh
+sbatch scripts/trainer_32b.sh
+```
+
+Outputs: `models/qwen2.5-{14B,32B}/router_model.joblib`, `outputs/qwen2.5-{14B,32B}/`

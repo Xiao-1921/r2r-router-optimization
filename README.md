@@ -27,7 +27,7 @@ Notes:
 This codebase is set up for two main environments:
 
 - Apple Silicon macOS with PyTorch MPS acceleration. This is the default local inference path (`--device mps`).
-- Linux GPU nodes with NVIDIA CUDA. The repository includes Slurm scripts for USC CARC in [scripts/run_qwen_3b.slurm](/Users/castro/JUST_DO_IT/production/study/USC/2026Spring/csci544/project/r2r-router-optimization/scripts/run_qwen_3b.slurm) and [scripts/run_qwen_7b.slurm](/Users/castro/JUST_DO_IT/production/study/USC/2026Spring/csci544/project/r2r-router-optimization/scripts/run_qwen_7b.slurm).
+- Linux GPU nodes with NVIDIA CUDA. The repository includes Slurm scripts for USC CARC in [scripts/run_qwen_3b.slurm](scripts/run_qwen_3b.slurm) and [scripts/run_qwen_7b.slurm](scripts/run_qwen_7b.slurm).
 
 The inference script also supports CPU with `--device cpu`.
 
@@ -140,3 +140,136 @@ sbatch scripts/trainer_32b.sh
 ```
 
 Outputs: `models/qwen2.5-{14B,32B}/router_model.joblib`, `outputs/qwen2.5-{14B,32B}/`
+
+---
+
+## Reflector
+
+The **reflector** is a complementary component to the router. Rather than routing questions to an external retrieval system, it decides whether the model should re-answer a question using a different prompting strategy — all based on the model's own internal uncertainty signals, with no ground-truth labels at inference time.
+
+### Concept
+
+When a language model answers a multiple-choice question, each candidate label receives a probability under the first-token distribution. Two signals extracted from this distribution are particularly informative:
+
+- **Margin** — `p(top1) − p(top2)`: how decisively the model picked one answer over the second-best.
+- **Entropy over labels** — Shannon entropy of the label-probability distribution: how spread out the model's probability mass is across the options.
+
+Both signals have ROC-AUC ≈ 0.82 when used to predict whether the model's answer is wrong (measured over 1 500 MCQ questions, Qwen2.5-3B-Instruct). Low margin or high entropy is a reliable indicator that a second pass is worth attempting.
+
+### How It Works
+
+Each question goes through up to two inference passes.
+
+**Pass 1 — Direct pass**
+
+The model answers the question normally. The first-token distribution over option labels is recorded. Confidence thresholds are set from the 25th / 50th / 75th percentiles of these signals across the evaluation set. Each question is assigned a regime:
+
+| Regime | Condition |
+|--------|-----------|
+| `high` | entropy ≤ median AND margin ≥ median |
+| `low` | entropy ≥ 75th pct OR margin ≤ 25th pct |
+| `medium` | everything else |
+
+**Policy decision**
+
+A reflection policy decides whether to trigger a second pass based solely on the direct-pass signals:
+
+| Policy | Reflects when |
+|--------|---------------|
+| `direct_baseline` | Never (baseline) |
+| `always_reflect_once` | Always |
+| `blind_gate_once` | Regime is `medium` or `low` |
+| `oracle_gate_once` | Model was wrong — uses gold label (upper bound, not deployable) |
+| `*_twice` variants | Same gates, but up to 2 reflection passes; pass 2 is skipped if confidence rises to `high` after pass 1 |
+
+**Pass 2 — Reflection pass**
+
+When reflection is triggered, a different system prompt instructs the model to approach the problem from a fresh angle. Four prompt styles are available and rotate across passes:
+
+| Style | Instruction given to the model |
+|-------|-------------------------------|
+| `plain_retry` | Evaluate from scratch with a fresh pass |
+| `error_scan` | Silently scan for mistakes — negation, option mismatch, unsupported assumptions |
+| `option_elimination` | Silently eliminate the weakest options, then choose the strongest remaining |
+| `evidence_reconstruction` | Silently reconstruct the key evidence before deciding |
+
+All reflection prompts are label-only (no chain-of-thought output), so the uncertainty signals from pass 2 are directly comparable to pass 1 signals. None of the prompts reveal the model's previous answer.
+
+**Abstention**
+
+When abstention is enabled (`ENABLE_ABSTAIN = True`), if the model's confidence regime after the final reflection pass is still `low`, the system outputs `NOT_SURE` instead of a forced label. Metrics are reported both with abstention (selective accuracy, coverage) and without it (forced accuracy).
+
+### Context Handling
+
+The dataset contains questions from six sources. Only **ReClor** questions include a reading passage. Context is passed to the model for ReClor rows only — all other sources receive no context. This is validated automatically in the notebook before analysis runs.
+
+### Dataset
+
+The reflector evaluates on `data/raw/Test.csv`: 300 questions, 50 from each of the six sources — SciQ, MedQA, MMLU, ARC-Easy, ReClor, and AQUA-RAT.
+
+### How to Run the Reflector
+
+The reflector runs as Jupyter notebooks in **Google Colab** with a GPU runtime. Models are loaded in 4-bit quantization (NF4 via bitsandbytes), so no local GPU is required.
+
+#### Main notebook — full policy × prompt grid
+
+`reflector/Reflection_Policy_Prompt_Grid.ipynb`
+
+This is the primary deliverable. It runs all 4 model sizes (3B / 7B / 14B / 32B) through every combination of 6 policies × 4 prompt styles on the full `Test.csv`.
+
+**Setup**:
+
+1. Open the notebook in Google Colab and enable a GPU runtime (`Runtime > Change runtime type > GPU`).
+2. Mount Google Drive when prompted. The notebook creates a `NLP Project/reflection-policy-prompt-grid/` folder there and caches all intermediate results. If a run is interrupted, re-running the notebook resumes from the last completed combination without re-running inference.
+3. Place `Test.csv` in `My Drive/NLP Project/New Dataset/Test.csv`, or update `DATA_PATH` in cell 2.
+4. Cell 2 installs all required packages automatically (`bitsandbytes`, `accelerate`, `transformers`, `sentencepiece`, `safetensors`).
+
+**What it produces** (saved to Google Drive):
+
+- `direct_results.csv` — per-model first-pass predictions and uncertainty signals for every row
+- `experiment_rows.csv` — per-model results for every (policy, prompt style) combination
+- `blind_thresholds.json` — data-driven confidence thresholds derived from the direct-pass distribution
+- `summary_metrics.csv` — aggregated accuracy, abstention rate, correction rate, degradation rate
+- `summary_by_source.csv` — same metrics broken down by dataset source
+- `blind_oracle_gap.csv` — how much blind gating falls short of the oracle upper bound
+- `one_vs_two_pass_comparison.csv` — delta between single-pass and two-pass reflection
+- `regime_breakdown.csv` — trigger rate and accuracy split by confidence regime
+- PNG heatmaps for forced accuracy, selective accuracy, abstention rate, correction rate, degradation rate, and per-source breakdowns
+
+#### Initial experiment notebooks
+
+`reflector/initial experiments/` contains the exploratory notebooks that established the approach:
+
+| Notebook | Purpose |
+|----------|---------|
+| `Router_Reflector_Dataset_Gathering.ipynb` | Data collection and dataset curation |
+| `Router_Reflector_Dataset_Exploration.ipynb` | EDA — source distribution, label balance, signal distributions |
+| `Reflector_Baselines_Exploration.ipynb` | Early baseline experiments |
+| `Reflector_Experiments.ipynb` | Three structured experiments: baseline accuracy, oracle retry upper bound, and signal quality for predicting errors |
+| `MCQ_Combined_Experiments_3B/7B/14B/32B.ipynb` | Per-model combined experiments across model sizes |
+
+These notebooks are designed to run sequentially. Each saves results to disk so later cells can load from checkpoints. `Reflector_Experiments.ipynb` is the best starting point to understand the signal analysis.
+
+### Key Results
+
+All numbers are from `Reflector_Experiments.ipynb` on Qwen2.5-3B-Instruct over 1 500 questions.
+
+**Uncertainty signals predict errors reliably**
+
+| Signal | ROC-AUC | Avg Precision |
+|--------|---------|---------------|
+| Entropy over labels | 0.819 | 0.644 |
+| Entropy over vocab | 0.819 | 0.643 |
+| 1 − margin | 0.818 | 0.637 |
+| 1 − top-1 prob | 0.819 | 0.638 |
+
+All four signals perform similarly, confirming that the first-token label distribution is a reliable proxy for model confidence.
+
+**Oracle retry recovery (upper bound)**
+
+When the model is wrong and given a structured retry prompt:
+- 37.8% of wrong answers are recovered
+- Baseline accuracy: 65.1% → post-retry accuracy: 78.3% (+13.2 pp)
+- Answer change rate: 99.6% (the model almost always picks a different label when told it was wrong)
+
+This establishes the ceiling for reflection-based improvement. The `oracle_gate` policy in the main notebook approximates this upper bound; `blind_gate` is the deployable version that uses only uncertainty signals.

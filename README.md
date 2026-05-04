@@ -1,6 +1,8 @@
-# R2R Router Optimization
+# When Should a Language Model Trust Itself: Routing and Reflection for Reliable Generation
 
-## How to Set Up the Environment
+## Router
+
+### How to Set Up the Environment
 
 Use Python 3.10 or newer.
 
@@ -28,7 +30,7 @@ Notes:
 - The inference script downloads the Hugging Face model specified by `--hf-model-id`.
 - If you want to control the Hugging Face cache location, set `HF_HOME` before running inference.
 
-## Device or System Used to Run the Code
+### Device or System Used to Run the Code
 
 This codebase is set up for two main environments:
 
@@ -39,11 +41,11 @@ The inference script also supports CPU with `--device cpu`.
 
 The R2R baseline comparison (`src/r2r_baseline_comparison.py`) requires a CUDA GPU with at least 16 GB VRAM (A100 recommended). It uses 4-bit quantization via bitsandbytes.
 
-## Instructions for Running the Code
+### Instructions for Running the Code
 
 Run the pipeline from the repository root.
 
-### 1. Generate model inference outputs
+#### 1. Generate model inference outputs
 
 ```bash
 python src/inference_qwen_mcq.py \
@@ -64,7 +66,7 @@ This step writes inference results to:
 - `data/processed/qwen2.5-0.5b/inference_results_train.pkl`
 - `data/processed/qwen2.5-0.5b/inference_results_test.pkl`
 
-### 2. Build router feature matrices
+#### 2. Build router feature matrices
 
 ```bash
 python src/prepare_dataset.py --model_name qwen2.5-0.5b --split train
@@ -76,7 +78,7 @@ This step writes:
 - `data/processed/qwen2.5-0.5b/router_training_matrix_train.pkl`
 - `data/processed/qwen2.5-0.5b/router_training_matrix_test.pkl`
 
-### 3. Train and evaluate the router
+#### 3. Train and evaluate the router
 
 ```bash
 python src/trainer.py \
@@ -91,7 +93,7 @@ This step writes:
 - `outputs/qwen2.5-0.5b/calibration.png`
 - `outputs/qwen2.5-0.5b/feature_importance.png`
 
-### 4. Run R2R baseline comparison (Router + RAG)
+#### 4. Run R2R baseline comparison (Router + RAG)
 
 This runs all three conditions (No RAG, Always RAG, Router RAG) on the test set using the trained router and the RAG retrieval pipeline. Requires a CUDA GPU.
 
@@ -136,14 +138,14 @@ This step writes:
 
 - `outputs/<model_name>/r2r_baseline_comparison.csv`
 
-### 5. Optional report figures
+#### 5. Optional report figures
 
 ```bash
 python src/generate_report_visuals.py
 python src/report_charts.py
 ```
 
-### 6. Generate a new evaluation dataset
+#### 6. Generate a new evaluation dataset
 
 To sample a fresh set of questions with deduplication against the existing training pool:
 
@@ -161,7 +163,7 @@ This produces three stratified splits with zero overlap against the existing dat
 - `data/raw/Validation.csv` (300 questions, 50 per benchmark)
 - `data/raw/Test.csv` (300 questions, 50 per benchmark)
 
-## How the Results Are Generated
+### How the Results Are Generated
 
 The project generates results in four stages:
 
@@ -185,15 +187,15 @@ Each query is passed to Wikipedia's opensearch API, which returns pages ranked b
 
 For the Always RAG baseline, the similarity filter is removed to show the true cost of indiscriminate retrieval. For Router RAG, the filter is applied and retrieval is only triggered when the router predicts failure.
 
-## Running 14B and 32B on USC CARC
+### Running 14B and 32B on USC CARC
 
-Parth Gosar extended the pipeline to Qwen2.5-14B-Instruct and Qwen2.5-32B-Instruct. Submit from the repo root after activating the venv:
+Extending the pipeline to Qwen2.5-14B-Instruct and Qwen2.5-32B-Instruct. Submit from the repo root after activating the venv:
 
 ```bash
 source venv_carc/bin/activate
 ```
 
-### Step 1 — Inference
+#### Step 1 — Inference
 
 **14B** (~10 hrs for Train split, runs on V100):
 ```bash
@@ -210,7 +212,7 @@ sbatch scripts/run_qwen_32b.slurm
 
 Outputs: `data/processed/qwen2.5-{14B,32B}/inference_results_{train,validation,test}.{pkl,csv}`
 
-### Step 2 — Feature Engineering
+#### Step 2 — Feature Engineering
 ```bash
 sbatch scripts/prepare_dataset_14b.sh
 sbatch scripts/prepare_dataset_32b.sh
@@ -218,7 +220,7 @@ sbatch scripts/prepare_dataset_32b.sh
 
 Outputs: `data/processed/qwen2.5-{14B,32B}/router_training_matrix_{split}.{pkl,csv}`
 
-### Step 3 — Router Training
+#### Step 3 — Router Training
 ```bash
 sbatch scripts/trainer_14b.sh
 sbatch scripts/trainer_32b.sh
@@ -226,7 +228,7 @@ sbatch scripts/trainer_32b.sh
 
 Outputs: `models/qwen2.5-{14B,32B}/router_model.joblib`, `outputs/qwen2.5-{14B,32B}/`
 
-### Step 4 — R2R Baseline Comparison
+#### Step 4 — R2R Baseline Comparison
 
 After router training, run the three-way comparison for each model size:
 
@@ -307,7 +309,7 @@ The reflector evaluates on `data/raw/Test.csv`: 300 questions, 50 from each of t
 
 ### How to Run the Reflector
 
-The reflector runs as Jupyter notebooks in **Google Colab** with a GPU runtime. Models are loaded in 4-bit quantization (NF4 via bitsandbytes), so no local GPU is required.
+The reflector runs as Jupyter notebooks in **Google Colab** with a GPU runtime. Models are loaded in 4-bit quantization (NF4 via bitsandbytes), so you can run this on Colab's GPU runtime without needing a local GPU.
 
 #### Main notebook — full policy × prompt grid
 

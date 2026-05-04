@@ -241,6 +241,14 @@ python src/r2r_baseline_comparison.py \
   --test_csv data/raw/Test.csv
 ```
 
+```
+python src/r2r_baseline_comparison.py \
+  --model_name qwen2.5-32B \
+  --hf_model_id Qwen/Qwen2.5-32B-Instruct \
+  --router_path models/qwen2.5-32B/router_model.joblib \
+  --feature_matrix data/processed/qwen2.5-32B/router_training_matrix_test.csv \
+  --test_csv data/raw/Test.csv
+
 ---
 
 ## Reflector
